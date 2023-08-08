@@ -14,8 +14,8 @@ import (
 )
 
 type conf struct {
-	Peers map[string]string `yaml:"peers"`
-	Rest  map[string]string `yaml:"rest"`
+	Peers map[string][]string `yaml:"peers"`
+	Rest  map[string]string   `yaml:"rest"`
 }
 
 type KV struct {
@@ -25,6 +25,15 @@ type KV struct {
 
 var RecvConnections []net.Conn
 var DialConnections []net.Conn
+
+type PeerConnection struct {
+	RecvConnection    net.Conn
+	DialConnection    net.Conn
+	RecvConnectionRaw string
+	DialConnectionRaw string
+}
+
+var Peers map[string]PeerConnection
 
 func (c *conf) unMarshalConfig() *conf {
 	yamlFile, err := ioutil.ReadFile("./config.yml")
@@ -45,13 +54,13 @@ var ProposalMap map[string]string
 
 // Entrypoint
 func main() {
-	args := os.Args
-	pid := args[1]
 
-	var c conf
+	pid := os.Args[1]
+	var c conf = conf{}
 	c.unMarshalConfig()
-	fmt.Println(c.Peers)
-	go setupServer(pid, c.Peers[pid])
+
+	Peers = createPeers(c)
+	go setupServer(pid, c.Peers[pid][0])
 	go connectToPeers(pid, c.Peers)
 	go heartBeats(pid)
 	Map = make(map[string]string)
@@ -61,6 +70,17 @@ func main() {
 	e.GET("/get/:key", getFn)
 	go Listen()
 	e.Logger.Fatal(e.Start(c.Rest[pid]))
+}
+
+func createPeers(c conf) map[string]PeerConnection {
+	Peers := make(map[string]PeerConnection, len(c.Peers))
+	for pid, peerDetails := range c.Peers {
+		Peers[pid] = PeerConnection{
+			RecvConnectionRaw: peerDetails[0],
+			DialConnectionRaw: peerDetails[1],
+		}
+	}
+	return Peers
 }
 
 func getFn(context echo.Context) error {
@@ -113,16 +133,17 @@ func setupServer(pid string, address string) {
 			fmt.Println("Error accepting connection: ", err)
 		}
 		RecvConnections = append(RecvConnections, connection)
+		fmt.Println("here")
 	}
 }
 
-func connectToPeers(pid string, peers map[string]string) {
+func connectToPeers(pid string, peers map[string][]string) {
 	for peerPid, peerAddr := range peers {
 		if pid != peerPid {
-			connection, err := net.Dial("tcp", peerAddr)
+			connection, err := net.Dial("tcp", peerAddr[1])
 			for err != nil {
 				time.Sleep(2 * time.Second)
-				connection, err = net.Dial("tcp", peerAddr)
+				connection, err = net.Dial("tcp", peerAddr[1])
 			}
 			DialConnections = append(DialConnections, connection)
 		}
