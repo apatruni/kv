@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo"
 	"gopkg.in/yaml.v2"
 )
 
@@ -23,14 +23,15 @@ type KV struct {
 	Value string
 }
 
-var RecvConnections []net.Conn
 var DialConnections []net.Conn
 
 type PeerConnection struct {
-	RecvConnection    net.Conn
-	DialConnection    net.Conn
-	RecvConnectionRaw string
-	DialConnectionRaw string
+	HeartbeatConnection         net.Conn
+	DialConnection              net.Conn
+	IncomingHeartbeatConnection net.Conn
+	RecvConnection              net.Conn
+	HeartbeatConnectionStr      string
+	DialConnectionStr           string
 }
 
 var Peers map[string]PeerConnection
@@ -58,26 +59,30 @@ func main() {
 	pid := os.Args[1]
 	var c conf = conf{}
 	c.unMarshalConfig()
+	Peers = createPeers(c, pid)
 
-	Peers = createPeers(c)
-	go setupServer(pid, c.Peers[pid][0])
-	go connectToPeers(pid, c.Peers)
-	go heartBeats(pid)
+	go setupServer(pid)
+	time.Sleep(2 * time.Second)
+	connectToPeers(pid)
+	time.Sleep(2 * time.Second)
+	fmt.Println(pid, Peers)
+	go Listen()
+	time.Sleep(2 * time.Second)
+	// go heartBeats(pid)
 	Map = make(map[string]string)
-	Map["test"] = "some value"
 	e := echo.New()
 	e.POST("/put", putFn)
 	e.GET("/get/:key", getFn)
-	go Listen()
+
 	e.Logger.Fatal(e.Start(c.Rest[pid]))
 }
 
-func createPeers(c conf) map[string]PeerConnection {
+func createPeers(c conf, currentPid string) map[string]PeerConnection {
 	Peers := make(map[string]PeerConnection, len(c.Peers))
 	for pid, peerDetails := range c.Peers {
 		Peers[pid] = PeerConnection{
-			RecvConnectionRaw: peerDetails[0],
-			DialConnectionRaw: peerDetails[1],
+			HeartbeatConnectionStr: peerDetails[0],
+			DialConnectionStr:      peerDetails[1],
 		}
 	}
 	return Peers
@@ -97,96 +102,127 @@ func getFn(context echo.Context) error {
 }
 
 func putFn(context echo.Context) error {
-	//propose := []byte("Proposal")
 	var kvBody *KV = new(KV)
 	context.Bind(kvBody)
 	Map[kvBody.Key] = kvBody.Value
-	//cnt := 0
-	// for _, peer := range DialConnections {
-	// 	_, _ = peer.Write(propose)
-	// 	_, _ = peer.Read(propose)
-	// 	cnt++
-	// }
-	// if cnt == 2 {
+
 	lenKey := strconv.Itoa(len(kvBody.Key))
 	lenVal := strconv.Itoa(len(kvBody.Value))
-
-	for _, peer := range DialConnections {
-		_, _ = peer.Write([]byte("Write|" + lenKey + "|" + kvBody.Key + "|" + lenVal + "|" + kvBody.Value))
-		fmt.Println("Write|" + lenKey + "|" + kvBody.Key + "|" + lenVal + "|" + kvBody.Value)
+	for pid, peerConnection := range Peers {
+		if pid != os.Args[1] {
+			_, _ = peerConnection.DialConnection.Write([]byte("Write|" + lenKey + "|" + kvBody.Key + "|" + lenVal + "|" + kvBody.Value))
+		}
 	}
-	// }
 	return nil
 }
 
-func setupServer(pid string, address string) {
-	fmt.Println("Starting to set up server for: ", pid)
-	listener, err := net.Listen("tcp", address)
+func setupServer(currentPid string) {
+	currentPeer := Peers[currentPid]
+	heartbeatListener, err := net.Listen("tcp", currentPeer.HeartbeatConnectionStr)
 	if err != nil {
-		fmt.Println("Error listening on address: ", address, err)
+		fmt.Println("Error setting up heartbeat listener: ", heartbeatListener, err)
 		os.Exit(1)
 	}
-	defer listener.Close()
+	defer heartbeatListener.Close()
+	proposalListener, err := net.Listen("tcp", currentPeer.DialConnectionStr)
+	if err != nil {
+		fmt.Println("Error setting up proposal listener: ", proposalListener, err)
+		os.Exit(1)
+	}
+	defer proposalListener.Close()
+
+	go setupConnectionListener(heartbeatListener, "heartbeat")
+	go setupConnectionListener(proposalListener, "data")
 	for {
-		connection, err := listener.Accept()
+
+	}
+}
+
+func setupConnectionListener(listener net.Listener, typ string) {
+	for {
+		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println("Error accepting connection: ", err)
 		}
-		RecvConnections = append(RecvConnections, connection)
-		fmt.Println("here")
-	}
-}
-
-func connectToPeers(pid string, peers map[string][]string) {
-	for peerPid, peerAddr := range peers {
-		if pid != peerPid {
-			connection, err := net.Dial("tcp", peerAddr[1])
-			for err != nil {
-				time.Sleep(2 * time.Second)
-				connection, err = net.Dial("tcp", peerAddr[1])
+		msg := make([]byte, 40)
+		n, _ := conn.Read(msg)
+		str := string(msg[:n])
+		vals := strings.Split(string(str), "|")
+		lenPid, _ := strconv.Atoi(vals[0])
+		peerPid := vals[1]
+		if typ == "heartbeat" {
+			if peerConn, ok := Peers[peerPid[:lenPid]]; ok {
+				peerConn.IncomingHeartbeatConnection = conn
+				Peers[peerPid[:lenPid]] = peerConn
 			}
-			DialConnections = append(DialConnections, connection)
+		} else {
+			if peerConn, ok := Peers[peerPid[:lenPid]]; ok {
+				peerConn.RecvConnection = conn
+				Peers[peerPid[:lenPid]] = peerConn
+			}
 		}
 	}
-	if len(DialConnections) != 2 {
-		fmt.Println("Did not establish correct number of connections")
-		os.Exit(1)
-	}
-	fmt.Println("Finished connecting to peers for pid: ", pid)
 }
 
-func heartBeats(pid string) {
-	time.Sleep(3 * time.Second)
-	helloMsg := make([]byte, len([]byte("hello")))
-	for {
-		for i, connection := range DialConnections {
-			_, err := connection.Write(helloMsg)
+func connectToPeers(currentPid string) {
+	for peerPid, peerConnection := range Peers {
+		if currentPid != peerPid {
+			dataSndConn, err := net.Dial("tcp", peerConnection.DialConnectionStr)
 			if err != nil {
-				DialConnections[i] = nil
+				fmt.Println("Error connecting to ", peerPid, " for data send, exiting", err)
+				os.Exit(1)
 			}
+			peerConnection.DialConnection = dataSndConn
+			currentPidStrLen := strconv.Itoa(len(currentPid))
+			dataSndConn.Write([]byte(currentPidStrLen + "|" + currentPid))
+			heartbeatConn, err := net.Dial("tcp", peerConnection.HeartbeatConnectionStr)
+			if err != nil {
+				fmt.Println("Error connecting to ", peerPid, " for heartbeat, exiting")
+				os.Exit(1)
+			}
+			peerConnection.HeartbeatConnection = heartbeatConn
+			heartbeatConn.Write([]byte(currentPidStrLen + "|" + currentPid))
+			Peers[peerPid] = peerConnection
 		}
-		time.Sleep(3 * time.Second)
 	}
 }
+
+// func heartBeats(currentPid string) {
+// 	time.Sleep(3 * time.Second)
+// 	helloMsg := make([]byte, len([]byte("hello")))
+// 	for {
+// 		for pid, connection := range Peers {
+// 			if currentPid != pid {
+// 				_, err := connection.HeartbeatConnection.Write(helloMsg)
+// 				if err != nil {
+// 					fmt.Println("Error during heartbeat, removing ")
+// 				}
+// 			}
+// 		}
+// 		time.Sleep(3 * time.Second)
+// 	}
+// }
 
 func Listen() {
 	for {
 		msg := make([]byte, 100)
-		for _, peer := range RecvConnections {
-			n, err := peer.Read(msg)
 
-			str := string(msg[:n])
+		for pid, peerConnection := range Peers {
 
-			if err == nil {
-				vals := strings.Split(string(str), "|")
-				if len(vals) < 3 {
-					time.Sleep(3 * time.Second)
-					continue
+			if pid != os.Args[1] {
+				n, err := peerConnection.RecvConnection.Read(msg)
+				str := string(msg[:n])
+
+				if err == nil {
+					vals := strings.Split(string(str), "|")
+					if len(vals) < 3 {
+						time.Sleep(3 * time.Second)
+						continue
+					}
+					lenKey, _ := strconv.Atoi(vals[1])
+					lenVal, _ := strconv.Atoi(vals[3])
+					Map[vals[2][:lenKey]] = vals[4][:lenVal]
 				}
-				lenKey, _ := strconv.Atoi(vals[1])
-				lenVal, _ := strconv.Atoi(vals[3])
-				Map[vals[2][:lenKey]] = vals[4][:lenVal]
-
 			}
 
 		}
