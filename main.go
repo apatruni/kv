@@ -73,6 +73,7 @@ func main() {
 	e := echo.New()
 	e.POST("/put", putFn)
 	e.GET("/get/:key", getFn)
+	e.DELETE("/delete", deleteFn)
 
 	e.Logger.Fatal(e.Start(c.Rest[pid]))
 }
@@ -111,6 +112,22 @@ func putFn(context echo.Context) error {
 	for pid, peerConnection := range Peers {
 		if pid != os.Args[1] {
 			_, _ = peerConnection.DialConnection.Write([]byte("Write|" + lenKey + "|" + kvBody.Key + "|" + lenVal + "|" + kvBody.Value))
+		}
+	}
+	context.Response().WriteHeader(200)
+	context.Response().Write([]byte("Inserted successfully"))
+	return nil
+}
+
+func deleteFn(context echo.Context) error {
+	var kvBody *KV = new(KV)
+	context.Bind(kvBody)
+	delete(Map, kvBody.Key)
+
+	lenKey := strconv.Itoa(len(kvBody.Key))
+	for pid, peerConnection := range Peers {
+		if pid != os.Args[1] {
+			_, _ = peerConnection.DialConnection.Write([]byte("Delete|" + lenKey + "|" + kvBody.Key))
 		}
 	}
 	return nil
@@ -187,22 +204,6 @@ func connectToPeers(currentPid string) {
 	}
 }
 
-// func heartBeats(currentPid string) {
-// 	time.Sleep(3 * time.Second)
-// 	helloMsg := make([]byte, len([]byte("hello")))
-// 	for {
-// 		for pid, connection := range Peers {
-// 			if currentPid != pid {
-// 				_, err := connection.HeartbeatConnection.Write(helloMsg)
-// 				if err != nil {
-// 					fmt.Println("Error during heartbeat, removing ")
-// 				}
-// 			}
-// 		}
-// 		time.Sleep(3 * time.Second)
-// 	}
-// }
-
 func Listen() {
 	for {
 		msg := make([]byte, 100)
@@ -219,9 +220,14 @@ func Listen() {
 						time.Sleep(3 * time.Second)
 						continue
 					}
-					lenKey, _ := strconv.Atoi(vals[1])
-					lenVal, _ := strconv.Atoi(vals[3])
-					Map[vals[2][:lenKey]] = vals[4][:lenVal]
+					if vals[0] == "Write" {
+						lenKey, _ := strconv.Atoi(vals[1])
+						lenVal, _ := strconv.Atoi(vals[3])
+						Map[vals[2][:lenKey]] = vals[4][:lenVal]
+					} else if vals[0] == "Delete" {
+						lenKey, _ := strconv.Atoi(vals[1])
+						delete(Map, vals[2][:lenKey])
+					}
 				}
 			}
 
