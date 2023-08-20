@@ -35,6 +35,8 @@ type PeerConnection struct {
 }
 
 var Peers map[string]PeerConnection
+var Order map[int]string
+var MyPriority int
 
 func (c *conf) unMarshalConfig() *conf {
 	yamlFile, err := ioutil.ReadFile("./config.yml")
@@ -55,8 +57,12 @@ var ProposalMap map[string]string
 
 // Entrypoint
 func main() {
-
+	Order = make(map[int]string)
+	Order[0] = "alpha"
+	Order[1] = "beta"
+	Order[2] = "gamma"
 	pid := os.Args[1]
+	MyPriority, _ = strconv.Atoi(os.Args[2])
 	var c conf = conf{}
 	c.unMarshalConfig()
 	Peers = createPeers(c, pid)
@@ -65,17 +71,31 @@ func main() {
 	time.Sleep(2 * time.Second)
 	connectToPeers(pid)
 	time.Sleep(2 * time.Second)
-	fmt.Println(pid, Peers)
-	go Listen()
-	time.Sleep(2 * time.Second)
-	// go heartBeats(pid)
-	Map = make(map[string]string)
-	e := echo.New()
-	e.POST("/put", putFn)
-	e.GET("/get/:key", getFn)
-	e.DELETE("/delete", deleteFn)
+	// fmt.Println(pid, Peers)
 
-	e.Logger.Fatal(e.Start(c.Rest[pid]))
+	go Listen()
+	time.Sleep(4 * time.Second)
+	leaderElection(pid, Peers)
+	time.Sleep(3 * time.Second)
+	// go heartBeats(pid)
+	// Map = make(map[string]string)
+	// e := echo.New()
+	// e.POST("/put", putFn)
+	// e.GET("/get/:key", getFn)
+	// e.DELETE("/delete", deleteFn)
+
+	// e.Logger.Fatal(e.Start(c.Rest[pid]))
+}
+
+func leaderElection(pid string, Peers map[string]PeerConnection) {
+	nextPid := Order[(MyPriority+1)%3]
+	pidStr := strconv.Itoa(MyPriority)
+	for i := 1; i == 1; i++ {
+		_, err := Peers[nextPid].DialConnection.Write([]byte(fmt.Sprintf("LeaderElection|%s", pidStr)))
+		if err != nil {
+			fmt.Println("Err on ldr election send: ", err)
+		}
+	}
 }
 
 func createPeers(c conf, currentPid string) map[string]PeerConnection {
@@ -206,31 +226,44 @@ func connectToPeers(currentPid string) {
 
 func Listen() {
 	for {
-		msg := make([]byte, 100)
 
 		for pid, peerConnection := range Peers {
 
 			if pid != os.Args[1] {
-				n, err := peerConnection.RecvConnection.Read(msg)
-				str := string(msg[:n])
-
-				if err == nil {
-					vals := strings.Split(string(str), "|")
-					if len(vals) < 3 {
-						time.Sleep(3 * time.Second)
-						continue
-					}
-					if vals[0] == "Write" {
-						lenKey, _ := strconv.Atoi(vals[1])
-						lenVal, _ := strconv.Atoi(vals[3])
-						Map[vals[2][:lenKey]] = vals[4][:lenVal]
-					} else if vals[0] == "Delete" {
-						lenKey, _ := strconv.Atoi(vals[1])
-						delete(Map, vals[2][:lenKey])
-					}
-				}
+				go Read(pid, peerConnection)
 			}
 
+		}
+	}
+}
+
+func Read(pid string, peerConnection PeerConnection) {
+	msg := make([]byte, 100)
+	n, err := peerConnection.RecvConnection.Read(msg)
+
+	if err == nil && n > 0 {
+		str := string(msg[:n])
+		vals := strings.Split(str, "|")
+
+		fmt.Println(os.Args[1], " received ", string(msg[:n]))
+		if vals[0] == "Write" {
+			lenKey, _ := strconv.Atoi(vals[1])
+			lenVal, _ := strconv.Atoi(vals[3])
+			Map[vals[2][:lenKey]] = vals[4][:lenVal]
+		} else if vals[0] == "Delete" {
+			lenKey, _ := strconv.Atoi(vals[1])
+			delete(Map, vals[2][:lenKey])
+		} else if vals[0] == "LeaderElection" {
+			receivedPid, _ := strconv.Atoi(vals[1][0:1])
+			//fmt.Println(os.Args[1], "got ", receivedPid)
+			if receivedPid == MyPriority {
+				fmt.Println(os.Args[1], " received message back, i am the leader")
+			} else if receivedPid > MyPriority {
+				nextPid := Order[(MyPriority+1)%3]
+				Peers[nextPid].DialConnection.Write([]byte(fmt.Sprintf("LeaderElection|%s", string(vals[1][0:1]))))
+			} else {
+				fmt.Println(os.Args[1], "dropping lower val ", vals[1][0:1])
+			}
 		}
 	}
 }
