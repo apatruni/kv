@@ -129,9 +129,9 @@ func main() {
 
 	// start REST server (Echo)
 	e := echo.New()
-	e.POST("/put", putFn)
-	e.GET("/get/:key", getFn)
-	e.DELETE("/delete", deleteFn)
+	e.POST("/kv/:key", putHandler)
+	e.GET("/kv/:key", getHandler)
+	e.DELETE("/kv/:key", deleteHandler)
 
 	restAddr := c.Rest[pid]
 	fmt.Println("REST server listening on", restAddr)
