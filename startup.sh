@@ -1,1 +1,1 @@
-go run main.go alpha 1 & go run main.go beta 2 & go run main.go gamma 0
+go run . alpha 1 & go run . beta 2 & go run . gamma 0
