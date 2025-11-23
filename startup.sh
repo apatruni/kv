@@ -1,1 +1,1 @@
-go run . alpha 1 & go run . beta 2 & go run . gamma 0
+go run . alpha & go run . beta & go run . gamma

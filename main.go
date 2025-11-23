@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,8 +15,9 @@ import (
 )
 
 type conf struct {
-	Peers map[string][]string `yaml:"peers"`
-	Rest  map[string]string   `yaml:"rest"`
+	Peers    map[string][]string `yaml:"peers"`
+	Rest     map[string]string   `yaml:"rest"`
+	Priority map[string]int      `yaml:"priority"`
 }
 
 type KV struct {
@@ -31,22 +32,21 @@ type PeerConnection struct {
 	RecvConnection              net.Conn
 	HeartbeatConnectionStr      string
 	DialConnectionStr           string
-	mutex                       sync.Mutex // protects writes on this peer's conns
+	mutex                       sync.Mutex
 }
 
 var (
-	Peers       map[string]*PeerConnection
-	Order       map[int]string
-	MyPriority  int
-	MapKV       map[string]string
-	ProposalMap map[string]string
+	Peers      map[string]*PeerConnection
+	NextNode   map[string]string
+	MyPriority int
+	MapKV      map[string]string
 
 	peersMutex sync.Mutex
 	kvMutex    sync.RWMutex
 )
 
 func (c *conf) unMarshalConfig() *conf {
-	yamlFile, err := ioutil.ReadFile("./config.yml")
+	yamlFile, err := os.ReadFile("./config.yml")
 	if err != nil {
 		fmt.Println("Error reading the config file: ", err)
 		os.Exit(1)
@@ -59,37 +59,80 @@ func (c *conf) unMarshalConfig() *conf {
 	return c
 }
 
-func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: main <pid> <priority>")
-		os.Exit(1)
+////////////////////////////////////////////////////////////////////////////////
+// RING BUILDING (Scales to N nodes)
+////////////////////////////////////////////////////////////////////////////////
+
+func buildRing(c *conf) {
+	var list []struct {
+		pid      string
+		priority int
 	}
 
-	Order = make(map[int]string)
-	Order[1] = "alpha"
-	Order[2] = "beta"
-	Order[0] = "gamma"
+	// convert priority map → sortable slice
+	for pid, pr := range c.Priority {
+		list = append(list, struct {
+			pid      string
+			priority int
+		}{pid, pr})
+	}
+
+	// sort by priority ascending (lower number = higher priority)
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].priority < list[j].priority
+	})
+
+	N := len(list)
+	NextNode = make(map[string]string, N)
+
+	// build ring successor map
+	for i := 0; i < N; i++ {
+		current := list[i].pid
+		next := list[(i+1)%N].pid
+		NextNode[current] = next
+	}
+
+	fmt.Println("=== RING ORDER ===")
+	for _, e := range list {
+		fmt.Println(" ", e.pid, "->", NextNode[e.pid])
+	}
+	fmt.Println("==================")
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// MAIN
+////////////////////////////////////////////////////////////////////////////////
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: main <pid>")
+		os.Exit(1)
+	}
 
 	pid := os.Args[1]
-	p, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		fmt.Println("Invalid priority:", os.Args[2])
-		os.Exit(1)
-	}
-	MyPriority = p
 
-	// initialize maps
-	MapKV = make(map[string]string)
-	ProposalMap = make(map[string]string)
-	Peers = make(map[string]*PeerConnection)
-
-	var c conf = conf{}
+	var c conf
 	c.unMarshalConfig()
 
-	// build Peers (strings)
+	// load priority from config
+	priorityValue, ok := c.Priority[pid]
+	if !ok {
+		fmt.Println("No priority entry in config for pid:", pid)
+		os.Exit(1)
+	}
+	MyPriority = priorityValue
+
+	// build dynamic ring
+	buildRing(&c)
+
+	// init maps
+	MapKV = make(map[string]string)
+	Peers = make(map[string]*PeerConnection)
+
+	// build peer configs
 	for peerID, details := range c.Peers {
 		if len(details) < 2 {
-			fmt.Println("peer", peerID, "needs two endpoints in config (heartbeat, data)")
+			fmt.Println("peer", peerID, "needs two endpoints (heartbeat + data)")
 			os.Exit(1)
 		}
 		Peers[peerID] = &PeerConnection{
@@ -98,16 +141,14 @@ func main() {
 		}
 	}
 
-	// start listeners for this node
+	// start listeners
 	go setupServer(pid)
-
-	// give listeners a moment to start
 	time.Sleep(500 * time.Millisecond)
 
-	// connect to other peers
+	// connect outwards
 	connectToPeers(pid)
 
-	// start background heartbeat loops for peers
+	// heartbeat loop
 	for id := range Peers {
 		if id == pid {
 			continue
@@ -115,7 +156,7 @@ func main() {
 		go peerHeartbeatLoop(id)
 	}
 
-	// Start per-peer read loops
+	// per-peer read loops
 	for id := range Peers {
 		if id == pid {
 			continue
@@ -123,11 +164,11 @@ func main() {
 		go peerReadLoop(id, Peers[id])
 	}
 
-	// small delay then trigger leader election attempt
+	// start ring election
 	time.Sleep(1 * time.Second)
 	go leaderElection(pid)
 
-	// start REST server (Echo)
+	// REST (KV API)
 	e := echo.New()
 	e.POST("/kv/:key", putHandler)
 	e.GET("/kv/:key", getHandler)
@@ -138,27 +179,63 @@ func main() {
 	e.Logger.Fatal(e.Start(restAddr))
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// LEADER ELECTION — Scales to N nodes
+////////////////////////////////////////////////////////////////////////////////
+
 func leaderElection(myPid string) {
-	// simple circular token passing
-	// send our priority to next node once
-	nextPid := Order[(MyPriority+1)%3]
-	if nextPeer, ok := Peers[nextPid]; ok {
-		msg := fmt.Sprintf("LeaderElection|%d", MyPriority)
-		writeToPeer(nextPid, nextPeer, []byte(msg))
-		fmt.Println(myPid, "sent leader election token with priority", MyPriority, "to", nextPid)
+	next := NextNode[myPid]
+	if pc, ok := Peers[next]; ok {
+		msg := fmt.Sprintf("LeaderElection|%d|%s", MyPriority, myPid)
+		writeToPeer(next, pc, []byte(msg))
+		fmt.Println(myPid, "sent election token:", msg, "to", next)
 	}
 }
+
+func handleLeaderElection(from string, parts []string, myPid string) {
+	if len(parts) < 3 {
+		return
+	}
+
+	receivedPrio, _ := strconv.Atoi(parts[1])
+	origin := parts[2]
+
+	// if token returns to origin, origin is leader
+	if origin == myPid {
+		fmt.Printf("✔ %s is the leader (priority: %d)\n", myPid, MyPriority)
+		return
+	}
+
+	// choose the higher priority (lower number = stronger)
+	forwardPrio := receivedPrio
+	forwardOrigin := origin
+
+	// our priority is higher (lower number)
+	if MyPriority < receivedPrio {
+		forwardPrio = MyPriority
+		forwardOrigin = myPid
+	}
+
+	next := NextNode[myPid]
+	if pc, ok := Peers[next]; ok {
+		msg := fmt.Sprintf("LeaderElection|%d|%s", forwardPrio, forwardOrigin)
+		writeToPeer(next, pc, []byte(msg))
+		fmt.Println("forwarded election token:", msg, "to", next)
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// PEER COMMUNICATION
+////////////////////////////////////////////////////////////////////////////////
 
 func writeToPeer(pid string, pc *PeerConnection, data []byte) error {
 	pc.mutex.Lock()
 	defer pc.mutex.Unlock()
 
-	// prefer DialConnection for data channel writes
 	if pc.DialConnection != nil {
 		_, err := pc.DialConnection.Write(data)
 		return err
 	}
-	// fallback - maybe peer accepted but our dial didn't work; try RecvConnection if it is usable
 	if pc.RecvConnection != nil {
 		_, err := pc.RecvConnection.Write(data)
 		return err
@@ -186,7 +263,6 @@ func setupServer(currentPid string) {
 
 	fmt.Println(currentPid, "listening heartbeat on", peer.HeartbeatConnectionStr, "data on", peer.DialConnectionStr)
 
-	// Accept heartbeats
 	go func() {
 		for {
 			conn, err := hListener.Accept()
@@ -194,12 +270,10 @@ func setupServer(currentPid string) {
 				fmt.Println("heartbeat accept err:", err)
 				continue
 			}
-			// handle handshake in goroutine
 			go handshakeAccept(conn, "heartbeat")
 		}
 	}()
 
-	// Accept data connections
 	go func() {
 		for {
 			conn, err := dListener.Accept()
@@ -213,28 +287,23 @@ func setupServer(currentPid string) {
 }
 
 func handshakeAccept(conn net.Conn, typ string) {
-	// read initial handshake: "<len>|<pid>"
 	buf := make([]byte, 64)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, err := conn.Read(buf)
 	conn.SetReadDeadline(time.Time{})
 	if err != nil {
-		// If handshake didn't come in time, still keep connection but log
-		fmt.Println("handshake read err:", err)
-		// close connection - we expect handshake immediately
 		conn.Close()
 		return
 	}
+
 	str := string(buf[:n])
 	parts := strings.SplitN(str, "|", 2)
 	if len(parts) != 2 {
-		fmt.Println("invalid handshake:", str)
 		conn.Close()
 		return
 	}
 	lenPid, err := strconv.Atoi(parts[0])
 	if err != nil || len(parts[1]) < lenPid {
-		fmt.Println("bad handshake length or pid:", str)
 		conn.Close()
 		return
 	}
@@ -244,22 +313,19 @@ func handshakeAccept(conn net.Conn, typ string) {
 	pc, ok := Peers[peerPid]
 	peersMutex.Unlock()
 	if !ok {
-		fmt.Println("handshake from unknown peer", peerPid)
 		conn.Close()
 		return
 	}
 
+	pc.mutex.Lock()
 	if typ == "heartbeat" {
-		pc.mutex.Lock()
 		pc.IncomingHeartbeatConnection = conn
-		pc.mutex.Unlock()
 		fmt.Println("accepted heartbeat from", peerPid)
 	} else {
-		pc.mutex.Lock()
 		pc.RecvConnection = conn
-		pc.mutex.Unlock()
 		fmt.Println("accepted data connection from", peerPid)
 	}
+	pc.mutex.Unlock()
 }
 
 func connectToPeers(currentPid string) {
@@ -268,11 +334,8 @@ func connectToPeers(currentPid string) {
 			continue
 		}
 
-		// connect data (dial to peer's data port)
 		dataConn, err := net.Dial("tcp", pc.DialConnectionStr)
-		if err != nil {
-			fmt.Println("Error connecting to", peerPid, "data:", err)
-		} else {
+		if err == nil {
 			lenStr := strconv.Itoa(len(currentPid))
 			_, _ = dataConn.Write([]byte(lenStr + "|" + currentPid))
 			pc.mutex.Lock()
@@ -281,11 +344,8 @@ func connectToPeers(currentPid string) {
 			fmt.Println(currentPid, "connected data ->", peerPid)
 		}
 
-		// connect heartbeat
 		hConn, err := net.Dial("tcp", pc.HeartbeatConnectionStr)
-		if err != nil {
-			fmt.Println("Error connecting to", peerPid, "heartbeat:", err)
-		} else {
+		if err == nil {
 			lenStr := strconv.Itoa(len(currentPid))
 			_, _ = hConn.Write([]byte(lenStr + "|" + currentPid))
 			pc.mutex.Lock()
@@ -308,17 +368,13 @@ func peerHeartbeatLoop(pid string) {
 		hc := pc.HeartbeatConnection
 		pc.mutex.Unlock()
 		if hc != nil {
-			_, err := hc.Write([]byte("HB|ping"))
-			if err != nil {
-				fmt.Println("heartbeat write err to", pid, err)
-			}
+			hc.Write([]byte("HB|ping"))
 		}
 	}
 }
 
 func peerReadLoop(pid string, pc *PeerConnection) {
 	for {
-		// wait for RecvConnection to be set by handshakeAccept
 		pc.mutex.Lock()
 		conn := pc.RecvConnection
 		pc.mutex.Unlock()
@@ -328,11 +384,9 @@ func peerReadLoop(pid string, pc *PeerConnection) {
 			continue
 		}
 
-		// read messages in a loop
 		buf := make([]byte, 4096)
 		n, err := conn.Read(buf)
 		if err != nil {
-			// connection may have been closed; reset and wait for reconnect
 			fmt.Println("read error from", pid, ":", err)
 			pc.mutex.Lock()
 			pc.RecvConnection = nil
@@ -347,68 +401,121 @@ func peerReadLoop(pid string, pc *PeerConnection) {
 	}
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// MESSAGE ROUTER
+////////////////////////////////////////////////////////////////////////////////
+
 func handleMessage(from string, raw string) {
 	fmt.Println("received from", from, "->", raw)
 	parts := strings.Split(raw, "|")
+
 	switch parts[0] {
+
 	case "Write":
-		if len(parts) >= 5 {
-			lenKey, _ := strconv.Atoi(parts[1])
-			key := parts[2]
-			if len(key) > lenKey {
-				key = key[:lenKey]
-			}
-			lenVal, _ := strconv.Atoi(parts[3])
-			val := parts[4]
-			if len(val) > lenVal {
-				val = val[:lenVal]
-			}
-			kvMutex.Lock()
-			MapKV[key] = val
-			kvMutex.Unlock()
-			fmt.Println("applied Write", key, val)
-		}
+		handleWrite(parts)
+
 	case "Delete":
-		if len(parts) >= 3 {
-			lenKey, _ := strconv.Atoi(parts[1])
-			key := parts[2]
-			if len(key) > lenKey {
-				key = key[:lenKey]
-			}
-			kvMutex.Lock()
-			delete(MapKV, key)
-			kvMutex.Unlock()
-			fmt.Println("applied Delete", key)
-		}
+		handleDelete(parts)
+
 	case "LeaderElection":
-		// received a priority token — basic circular algorithm:
-		if len(parts) < 2 {
-			return
-		}
-		receivedPriority, err := strconv.Atoi(parts[1])
-		if err != nil {
-			return
-		}
-		// if token returns to originator with same value it means that originator is leader
-		if receivedPriority == MyPriority {
-			fmt.Println("I am the leader (priority)", MyPriority)
-			return
-		}
-		// if received priority is higher than mine, forward it
-		if receivedPriority > MyPriority {
-			// forward to next
-			next := Order[(MyPriority+1)%3]
-			if pc, ok := Peers[next]; ok {
-				msg := fmt.Sprintf("LeaderElection|%d", receivedPriority)
-				_ = writeToPeer(next, pc, []byte(msg))
-				fmt.Println("forwarded higher leader token", receivedPriority, "to", next)
-			}
-		} else {
-			// if it's lower, we drop it (or we could inject our own higher priority)
-			fmt.Println("dropped lower leader token", receivedPriority)
-		}
+		handleLeaderElection(from, parts, os.Args[1])
+
 	default:
-		// unknown message
 		fmt.Println("unknown message:", raw)
 	}
+}
+
+func handleWrite(parts []string) {
+	if len(parts) < 5 {
+		return
+	}
+	lenKey, _ := strconv.Atoi(parts[1])
+	key := parts[2][:lenKey]
+
+	lenVal, _ := strconv.Atoi(parts[3])
+	val := parts[4][:lenVal]
+
+	kvMutex.Lock()
+	MapKV[key] = val
+	kvMutex.Unlock()
+
+	fmt.Println("applied Write", key, val)
+}
+
+func handleDelete(parts []string) {
+	if len(parts) < 3 {
+		return
+	}
+	lenKey, _ := strconv.Atoi(parts[1])
+	key := parts[2][:lenKey]
+
+	kvMutex.Lock()
+	delete(MapKV, key)
+	kvMutex.Unlock()
+
+	fmt.Println("applied Delete", key)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// REST API HANDLERS (unchanged)
+////////////////////////////////////////////////////////////////////////////////
+
+func getHandler(c echo.Context) error {
+	key := c.Param("key")
+	kvMutex.RLock()
+	val, ok := MapKV[key]
+	kvMutex.RUnlock()
+	if !ok {
+		return c.NoContent(404)
+	}
+	c.Response().Header().Set("Content-Length", strconv.Itoa(len(val)))
+	return c.String(200, val)
+}
+
+func putHandler(c echo.Context) error {
+	key := c.Param("key")
+
+	body := struct {
+		Value string `json:"value"`
+	}{}
+
+	if err := c.Bind(&body); err != nil {
+		return c.NoContent(400)
+	}
+
+	kvMutex.Lock()
+	MapKV[key] = body.Value
+	kvMutex.Unlock()
+
+	lenKey := strconv.Itoa(len(key))
+	lenVal := strconv.Itoa(len(body.Value))
+	msg := "Write|" + lenKey + "|" + key + "|" + lenVal + "|" + body.Value
+
+	for pid, pc := range Peers {
+		if pid == os.Args[1] {
+			continue
+		}
+		_ = writeToPeer(pid, pc, []byte(msg))
+	}
+
+	return c.String(200, "Inserted successfully")
+}
+
+func deleteHandler(c echo.Context) error {
+	key := c.Param("key")
+
+	kvMutex.Lock()
+	delete(MapKV, key)
+	kvMutex.Unlock()
+
+	lenKey := strconv.Itoa(len(key))
+	msg := "Delete|" + lenKey + "|" + key
+
+	for pid, pc := range Peers {
+		if pid == os.Args[1] {
+			continue
+		}
+		_ = writeToPeer(pid, pc, []byte(msg))
+	}
+	return c.NoContent(200)
 }

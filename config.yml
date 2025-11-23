@@ -12,3 +12,7 @@ rest:
   "alpha" : "127.0.0.1:10000"
   "beta" : "127.0.0.1:10001"
   "gamma" : "127.0.0.1:10002" 
+priority:
+  "alpha" : 1
+  "beta" : 2
+  "gamma" : 0
